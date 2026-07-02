@@ -1,0 +1,41 @@
+# USER-level systemd unit for running VCFight 24/7 with automatic
+# restart. It is installed under the bot's own Linux user account so it
+# can talk to that user's PulseAudio session (the audio bridge won't
+# work reliably from a system-wide service that has no PulseAudio
+# session to attach to).
+#
+# Install (as the "vcfight" user, NOT root):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/vcfight.service ~/.config/systemd/user/vcfight.service
+#   nano ~/.config/systemd/user/vcfight.service   # fix WorkingDirectory/paths below
+#   systemctl --user daemon-reload
+#   systemctl --user enable vcfight
+#   systemctl --user start vcfight
+#
+# Then, as root, allow it to keep running after you log out / on boot:
+#   sudo loginctl enable-linger vcfight
+#
+# Manage (as the "vcfight" user):
+#   systemctl --user status vcfight
+#   systemctl --user restart vcfight
+#   systemctl --user stop vcfight
+#   journalctl --user -u vcfight -f     # live logs
+
+[Unit]
+Description=VCFight - Telegram VC-to-VC Audio Forwarding Userbot
+After=network-online.target pulseaudio.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vcfight
+EnvironmentFile=%h/vcfight/.env
+ExecStart=%h/vcfight/venv/bin/python3 start.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
