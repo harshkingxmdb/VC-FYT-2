@@ -1,0 +1,65 @@
+{
+  "name": "VCFight - Telegram VC-to-VC Audio Forwarding Userbot",
+  "description": "Forwards live audio from one Telegram Voice Chat to another in real time, with configurable volume and bass.",
+  "repository": "https://github.com/harshkingxmdb/VC-FYT-2",
+  "keywords": ["telegram", "pyrogram", "pytgcalls", "voice-chat", "ffmpeg", "userbot"],
+  "stack": "heroku-22",
+  "buildpacks": [
+    { "url": "heroku-community/apt" },
+    { "url": "heroku/python" }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API hash from my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "BotFather token for the command-and-control bot",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Telegram user ID allowed to control the bot",
+      "required": true
+    },
+    "STRING_SESSION": {
+      "description": "Pyrogram string session for the assistant account (generate with gen_string.py)",
+      "required": true
+    },
+    "RECORD_GROUP": {
+      "description": "Group used to archive/upload recordings",
+      "required": true
+    },
+    "LOGGER_GROUP": {
+      "description": "Group whose Voice Chat is the live audio source",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection string",
+      "required": true
+    },
+    "DB_NAME": {
+      "description": "MongoDB database name",
+      "required": true
+    },
+    "PULSE_SINK_NAME": {
+      "description": "Name of the PulseAudio virtual sink bridge",
+      "required": false,
+      "value": "vcrelay"
+    },
+    "WORK_DIR": {
+      "description": "Working directory for logs, pipes, and recordings",
+      "required": false,
+      "value": "/tmp/vc_forward_bot"
+    }
+  }
+}
