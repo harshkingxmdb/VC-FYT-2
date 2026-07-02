@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.session
+*.session-journal
+gen_string_session.session
+/tmp/
+work_dir/
+*.log
+recordings/
+pipes/
+.DS_Store
+.vscode/
+.idea/
