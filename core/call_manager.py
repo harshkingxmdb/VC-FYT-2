@@ -159,8 +159,9 @@ class CallManager:
             # 1) Keep the Logger Group's voice chat fed with silence so the
             #    assistant can listen without talking over the owner.
             session.silence_process = await ffmpeg_utils.spawn(
-                ffmpeg_utils.build_silence_command(silence_pipe)
+                ffmpeg_utils.build_silence_command(silence_pipe), name="silence-feed"
             )
+            await ffmpeg_utils.ensure_alive(session.silence_process, "silence-feed ffmpeg")
 
             try:
                 await self.pytgcalls.play(
@@ -185,8 +186,10 @@ class CallManager:
             session.capture_process = await ffmpeg_utils.spawn(
                 ffmpeg_utils.build_capture_command(
                     session.monitor_source, output_pipe, session.level, session.bass, session.muted
-                )
+                ),
+                name="audio-capture",
             )
+            await ffmpeg_utils.ensure_alive(session.capture_process, "audio-capture ffmpeg")
 
             # 3) Join the target chat's voice chat, streaming that FIFO.
             try:
@@ -361,8 +364,10 @@ class CallManager:
                     session.level,
                     session.bass,
                     session.muted,
-                )
+                ),
+                name="audio-capture",
             )
+            await ffmpeg_utils.ensure_alive(session.capture_process, "audio-capture ffmpeg")
         log.info(
             "Applied audio settings for chat_id=%s: level=%s bass=%s muted=%s",
             session.target_chat_id,
