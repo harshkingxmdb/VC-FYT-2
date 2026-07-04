@@ -5,6 +5,7 @@ the named pipe consumed by the outgoing voice chat stream.
 """
 
 import asyncio
+import collections
 from typing import Optional
 
 import config
@@ -124,14 +125,57 @@ def build_record_command(monitor_source: str, output_file_path: str) -> list:
     ]
 
 
-async def spawn(cmd: list) -> asyncio.subprocess.Process:
-    log.info("Spawning ffmpeg process: %s", " ".join(cmd))
+async def _drain_stderr(name: str, process: asyncio.subprocess.Process) -> None:
+    """
+    Continuously reads ffmpeg's stderr and logs it. This is required, not
+    optional: if nobody reads a subprocess's PIPE, the OS pipe buffer
+    fills up once ffmpeg writes enough output and ffmpeg blocks trying to
+    write more, which looks exactly like a mysterious hang on /join. This
+    also gives us the real reason a capture process died (e.g. PulseAudio
+    not running, wrong monitor name, permission errors).
+    """
+    if process.stderr is None:
+        return
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore").rstrip()
+            if not text:
+                continue
+            process.stderr_lines.append(text)
+            log.warning("[ffmpeg:%s] %s", name, text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def spawn(cmd: list, name: str = "ffmpeg") -> asyncio.subprocess.Process:
+    log.info("Spawning %s: %s", name, " ".join(cmd))
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
+    process.stderr_lines = collections.deque(maxlen=40)  # type: ignore[attr-defined]
+    asyncio.create_task(_drain_stderr(name, process))
     return process
+
+
+async def ensure_alive(process: asyncio.subprocess.Process, name: str, settle_time: float = 0.6) -> None:
+    """
+    Gives a freshly spawned ffmpeg process a brief moment to fail fast
+    (bad input device, missing PulseAudio, permission errors, etc.) and
+    raises a clear error with the actual ffmpeg output if it already
+    exited, instead of silently proceeding into a pipe that will never
+    receive data.
+    """
+    await asyncio.sleep(settle_time)
+    if process.returncode is not None:
+        tail = "\n".join(getattr(process, "stderr_lines", [])) or "(no ffmpeg output captured)"
+        raise RuntimeError(
+            f"{name} exited immediately with code {process.returncode}.\n{tail}"
+        )
 
 
 async def terminate(process: Optional[asyncio.subprocess.Process]) -> None:
@@ -145,4 +189,3 @@ async def terminate(process: Optional[asyncio.subprocess.Process]) -> None:
         await process.wait()
     except ProcessLookupError:
         pass
-  
