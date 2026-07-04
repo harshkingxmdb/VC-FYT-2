@@ -48,18 +48,37 @@ def pulseaudio_available() -> bool:
     return shutil.which("pactl") is not None
 
 
+async def pulseaudio_daemon_reachable() -> "tuple[bool, str]":
+    """Distinguishes 'pactl not installed' from 'installed but the daemon
+    isn't running/reachable for this user' -- the single most common
+    reason /join appears to hang or fail with no useful error."""
+    _, out, err = await _run("pactl", "info")
+    if err:
+        return False, err
+    return True, out
+
+
 async def ensure_virtual_sink(sink_name: str = config.PULSE_SINK_NAME) -> str:
     """
     Creates (idempotently) a null-sink named `sink_name` and returns the
     device name of its monitor source, e.g. "vcrelay.monitor".
     """
     if not pulseaudio_available():
-        log.warning(
-            "pactl not found on this host. Install PulseAudio "
-            "(apt install pulseaudio pulseaudio-utils) for VC-to-VC "
-            "forwarding to work."
+        raise RuntimeError(
+            "pactl not found on this host. Install PulseAudio with "
+            "`apt install pulseaudio pulseaudio-utils` and re-run "
+            "./setup_pulseaudio.sh."
         )
-        return f"{sink_name}.monitor"
+
+    reachable, info_or_error = await pulseaudio_daemon_reachable()
+    if not reachable:
+        raise RuntimeError(
+            "PulseAudio is installed but its daemon isn't reachable for "
+            "this user account (this is the #1 cause of /join silently "
+            "failing). Run `pulseaudio --start` as the SAME user running "
+            "the bot, then try /join again. Underlying error: "
+            f"{info_or_error}"
+        )
 
     _, existing_sinks, _ = await _run("pactl", "list", "short", "sinks")
     if not any(line.split("\t")[1] == sink_name for line in existing_sinks.splitlines() if line):
@@ -92,4 +111,3 @@ async def teardown_virtual_sink(sink_name: str = config.PULSE_SINK_NAME) -> None
         if module_name == "module-null-sink" and f"sink_name={sink_name}" in args:
             await _run("pactl", "unload-module", module_id)
             log.info("Unloaded PulseAudio sink '%s' (module id=%s).", sink_name, module_id)
-      
