@@ -119,6 +119,24 @@ def _write_minimal_pulse_config(sink_name: str) -> str:
     return config_path
 
 
+async def _find_pulse_module_dir() -> "str | None":
+    """
+    Heroku's apt buildpack installs PulseAudio's loadable modules
+    (module-null-sink.so, module-native-protocol-unix.so, etc.) under
+    /app/.apt/... instead of the path the pulseaudio binary was compiled
+    to search by default, so it reports every module as "cannot open
+    shared object file" even though the .so files are present on disk.
+    Locate the actual directory and pass it explicitly via
+    --dl-search-path instead of relying on the compiled-in default.
+    """
+    _, out, _ = await _run(
+        "bash",
+        "-c",
+        "find /app/.apt /usr -type d -path '*pulse-*/modules' 2>/dev/null | head -n1",
+    )
+    return out.strip() or None
+
+
 async def _start_daemon() -> None:
     global _daemon_process
     _prepare_runtime_environment()
@@ -131,6 +149,24 @@ async def _start_daemon() -> None:
         return
 
     minimal_config_path = _write_minimal_pulse_config(config.PULSE_SINK_NAME)
+    module_dir = await _find_pulse_module_dir()
+    if module_dir:
+        log.info("Found PulseAudio module directory: %s", module_dir)
+    else:
+        log.warning(
+            "Could not locate a PulseAudio module directory under /app/.apt "
+            "or /usr; falling back to the compiled-in default search path."
+        )
+
+    cmd = [
+        "pulseaudio",
+        "-n",
+        f"--file={minimal_config_path}",
+        "--exit-idle-time=-1",
+        "--disallow-exit",
+    ]
+    if module_dir:
+        cmd.append(f"--dl-search-path={module_dir}")
 
     # Deliberately NOT using -D (daemonize): that makes pulseaudio fork
     # and re-exec itself, which sandboxed containers (Heroku dynos, some
@@ -139,11 +175,7 @@ async def _start_daemon() -> None:
     # process that we manage as a background task avoids that entirely.
     # `-n --file=...` skips the default script (see docstring above).
     _daemon_process = await asyncio.create_subprocess_exec(
-        "pulseaudio",
-        "-n",
-        f"--file={minimal_config_path}",
-        "--exit-idle-time=-1",
-        "--disallow-exit",
+        *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
