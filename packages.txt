@@ -1,5 +1,0 @@
-ffmpeg
-pulseaudio
-pulseaudio-utils
-xvfb
-x11-apps
