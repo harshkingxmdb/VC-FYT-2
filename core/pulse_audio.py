@@ -78,15 +78,49 @@ def _prepare_runtime_environment() -> None:
         os.environ["PULSE_ALLOW_ROOT"] = "1"
 
 
+_daemon_process: "asyncio.subprocess.Process | None" = None
+
+
+async def _drain_daemon_stderr(process: "asyncio.subprocess.Process") -> None:
+    if process.stderr is None:
+        return
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore").rstrip()
+            if text:
+                log.warning("[pulseaudio] %s", text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _start_daemon() -> None:
+    global _daemon_process
     _prepare_runtime_environment()
     log.info("Starting PulseAudio daemon automatically (XDG_RUNTIME_DIR=%s)...",
               os.environ.get("XDG_RUNTIME_DIR"))
-    _, out, err = await _run(
-        "pulseaudio", "-D", "--exit-idle-time=-1", "--disallow-exit"
+
+    if _daemon_process is not None and _daemon_process.returncode is None:
+        log.info("A PulseAudio process we started is already running; giving it a moment.")
+        await asyncio.sleep(1.5)
+        return
+
+    # Deliberately NOT using -D (daemonize): that makes pulseaudio fork
+    # and re-exec itself, which sandboxed containers (Heroku dynos, some
+    # Docker seccomp profiles) block ("personality() failed: Permission
+    # denied", "cannot self execute"). Running it as a plain foreground
+    # process that we manage as a background task avoids that entirely.
+    _daemon_process = await asyncio.create_subprocess_exec(
+        "pulseaudio",
+        "--exit-idle-time=-1",
+        "--disallow-exit",
+        "--disallow-module-loading=no",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if err:
-        log.warning("pulseaudio start reported: %s", err)
+    asyncio.create_task(_drain_daemon_stderr(_daemon_process))
     # Give it a moment to create its socket before the next check.
     await asyncio.sleep(1.5)
 
