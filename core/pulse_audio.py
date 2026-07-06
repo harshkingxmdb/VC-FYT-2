@@ -24,6 +24,7 @@ the bridge. Steps 2-3 live in `ffmpeg_utils.py` and `call_manager.py`.
 """
 
 import asyncio
+import os
 import shutil
 
 import config
@@ -58,6 +59,38 @@ async def pulseaudio_daemon_reachable() -> "tuple[bool, str]":
     return True, out
 
 
+def _prepare_runtime_environment() -> None:
+    """
+    PulseAudio needs $XDG_RUNTIME_DIR to create its socket, and refuses
+    to run as root unless $PULSE_ALLOW_ROOT is set. Neither exists by
+    default on Heroku dynos or fresh VPS boots (there's no login session
+    to create them), so this sets both up in the CURRENT process's
+    environment before we try to spawn the daemon -- using /tmp instead
+    of /run/user/<uid> since /tmp is reliably writable everywhere,
+    including restricted containers like Heroku dynos.
+    """
+    uid = os.getuid()
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        runtime_dir = f"/tmp/pulse-runtime-{uid}"
+        os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+        os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+    if uid == 0:
+        os.environ["PULSE_ALLOW_ROOT"] = "1"
+
+
+async def _start_daemon() -> None:
+    _prepare_runtime_environment()
+    log.info("Starting PulseAudio daemon automatically (XDG_RUNTIME_DIR=%s)...",
+              os.environ.get("XDG_RUNTIME_DIR"))
+    _, out, err = await _run(
+        "pulseaudio", "-D", "--exit-idle-time=-1", "--disallow-exit"
+    )
+    if err:
+        log.warning("pulseaudio start reported: %s", err)
+    # Give it a moment to create its socket before the next check.
+    await asyncio.sleep(1.5)
+
+
 async def ensure_virtual_sink(sink_name: str = config.PULSE_SINK_NAME) -> str:
     """
     Creates (idempotently) a null-sink named `sink_name` and returns the
@@ -72,11 +105,21 @@ async def ensure_virtual_sink(sink_name: str = config.PULSE_SINK_NAME) -> str:
 
     reachable, info_or_error = await pulseaudio_daemon_reachable()
     if not reachable:
+        # No daemon running yet (fresh dyno/VPS boot with nothing having
+        # started it) -- start it ourselves instead of requiring a human
+        # to SSH in and run `pulseaudio --start`, which isn't possible on
+        # platforms like Heroku.
+        log.warning(
+            "PulseAudio daemon not reachable (%s). Attempting to start it "
+            "automatically...", info_or_error
+        )
+        await _start_daemon()
+        reachable, info_or_error = await pulseaudio_daemon_reachable()
+
+    if not reachable:
         raise RuntimeError(
-            "PulseAudio is installed but its daemon isn't reachable for "
-            "this user account (this is the #1 cause of /join silently "
-            "failing). Run `pulseaudio --start` as the SAME user running "
-            "the bot, then try /join again. Underlying error: "
+            "PulseAudio daemon still isn't reachable after attempting to "
+            "start it automatically. Underlying error: "
             f"{info_or_error}"
         )
 
