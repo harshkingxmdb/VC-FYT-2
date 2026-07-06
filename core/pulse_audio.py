@@ -96,6 +96,29 @@ async def _drain_daemon_stderr(process: "asyncio.subprocess.Process") -> None:
         pass
 
 
+def _write_minimal_pulse_config(sink_name: str) -> str:
+    """
+    PulseAudio's default startup script (/etc/pulse/default.pa) tries to
+    load modules for D-Bus, udev device detection, Bluetooth, etc. None
+    of those exist in a headless container like a Heroku dyno, and when
+    every module in the default script fails, PulseAudio refuses to
+    start at all ("Daemon startup without any loaded modules, refusing
+    to work") -- even though the two modules we actually need (a unix
+    socket for pactl/ffmpeg, and our null-sink bridge) would have loaded
+    fine on their own. Writing our own minimal script and passing it
+    with `-n --file=...` skips the problematic default entirely.
+    """
+    config_path = os.path.join(config.WORK_DIR, "pulse-minimal.pa")
+    content = (
+        "load-module module-native-protocol-unix\n"
+        f"load-module module-null-sink sink_name={sink_name} "
+        f"sink_properties=device.description={MODULE_OWNER_DESCRIPTION}\n"
+    )
+    with open(config_path, "w") as f:
+        f.write(content)
+    return config_path
+
+
 async def _start_daemon() -> None:
     global _daemon_process
     _prepare_runtime_environment()
@@ -107,16 +130,20 @@ async def _start_daemon() -> None:
         await asyncio.sleep(1.5)
         return
 
+    minimal_config_path = _write_minimal_pulse_config(config.PULSE_SINK_NAME)
+
     # Deliberately NOT using -D (daemonize): that makes pulseaudio fork
     # and re-exec itself, which sandboxed containers (Heroku dynos, some
     # Docker seccomp profiles) block ("personality() failed: Permission
     # denied", "cannot self execute"). Running it as a plain foreground
     # process that we manage as a background task avoids that entirely.
+    # `-n --file=...` skips the default script (see docstring above).
     _daemon_process = await asyncio.create_subprocess_exec(
         "pulseaudio",
+        "-n",
+        f"--file={minimal_config_path}",
         "--exit-idle-time=-1",
         "--disallow-exit",
-        "--disallow-module-loading=no",
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
