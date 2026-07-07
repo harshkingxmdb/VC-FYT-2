@@ -137,6 +137,40 @@ async def _find_pulse_module_dir() -> "str | None":
     return out.strip() or None
 
 
+async def _apply_discovered_library_paths(module_dir: "str | None") -> None:
+    """
+    Some PulseAudio modules (e.g. module-native-protocol-unix.so) depend
+    on private helper libraries (e.g. libprotocol-native.so) that live in
+    yet another directory under Heroku's apt sandbox -- not necessarily
+    the modules directory itself, and not the standard system lib paths
+    covered by .profile.d/pulseaudio-libs.sh. Rather than guess exact
+    paths that shift between Heroku stack versions, search the apt
+    sandbox for every directory that actually contains a
+    PulseAudio-related shared library and add all of them to
+    LD_LIBRARY_PATH for this process (child processes, including the one
+    we're about to spawn, inherit it).
+    """
+    _, out, _ = await _run(
+        "bash",
+        "-c",
+        "find /app/.apt -name '*.so*' "
+        r"\( -iname '*pulse*' -o -iname 'libprotocol-native*' \) "
+        "-printf '%h\\n' 2>/dev/null | sort -u",
+    )
+    dirs = [d for d in out.splitlines() if d.strip()]
+    if module_dir:
+        dirs.append(module_dir)
+        dirs.append(os.path.dirname(module_dir))
+
+    if not dirs:
+        return
+
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    ordered_unique = list(dict.fromkeys(dirs + ([existing] if existing else [])))
+    os.environ["LD_LIBRARY_PATH"] = ":".join(ordered_unique)
+    log.info("Updated LD_LIBRARY_PATH with discovered PulseAudio library dirs: %s", dirs)
+
+
 async def _start_daemon() -> None:
     global _daemon_process
     _prepare_runtime_environment()
@@ -157,6 +191,7 @@ async def _start_daemon() -> None:
             "Could not locate a PulseAudio module directory under /app/.apt "
             "or /usr; falling back to the compiled-in default search path."
         )
+    await _apply_discovered_library_paths(module_dir)
 
     cmd = [
         "pulseaudio",
