@@ -28,6 +28,7 @@ from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality
 from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
+from pyrogram.errors import FloodWait
 
 import config
 from core import ffmpeg_utils, pipe_manager, pulse_audio
@@ -122,10 +123,35 @@ class CallManager:
     # ------------------------------------------------------------------ #
     # Join / Leave
     # ------------------------------------------------------------------ #
+    async def _resolve_peer(self, chat_id: int, label: str) -> None:
+        """
+        Pyrogram (and pytgcalls, which reuses its session) can only make
+        MTProto calls against a chat once it has that chat's access_hash
+        cached locally -- which only happens after the client has seen
+        the chat at least once (via get_chat, get_dialogs, or an
+        incoming update). Without this, joining a chat the assistant
+        hasn't "seen" yet fails with a cryptic "Peer id invalid" error
+        instead of a clear one. Resolving it explicitly here turns that
+        into an actionable message.
+        """
+        try:
+            await self.assistant.get_chat(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Could not resolve {label} (chat_id={chat_id}) with the "
+                f"assistant account. Make sure the assistant account "
+                f"(STRING_SESSION) is a member of that chat, and that the "
+                f"ID is correct (it should start with -100 for a "
+                f"supergroup/channel). Underlying error: {exc}"
+            ) from exc
+
     async def join(self, target_chat_id: int) -> ForwardSession:
         if target_chat_id in self.sessions:
             log.info("Session for chat_id=%s already active; re-using it.", target_chat_id)
             return self.sessions[target_chat_id]
+
+        await self._resolve_peer(target_chat_id, "target chat")
+        await self._resolve_peer(config.LOGGER_GROUP, "Logger Group")
 
         monitor_source = await self._ensure_bridge()
         settings = await db.get_settings(target_chat_id)
@@ -302,6 +328,15 @@ class CallManager:
             try:
                 await self._reconnect(session)
                 delay = RECONNECT_BASE_DELAY
+            except FloodWait as exc:
+                wait_seconds = exc.value + 2  # small safety margin
+                log.warning(
+                    "Telegram FloodWait while reconnecting chat_id=%s: "
+                    "waiting %ss as instructed before trying again.",
+                    session.target_chat_id,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
             except Exception as exc:  # noqa: BLE001
                 log.error(
                     "Reconnect attempt failed for chat_id=%s: %s",
