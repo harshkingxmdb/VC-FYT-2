@@ -10,6 +10,40 @@ were active before a restart, and idles until shutdown).
     python3 start.py
 """
 
+import os
+
+
+def _fix_apt_library_paths() -> None:
+    """
+    On Heroku, apt-buildpack-installed packages (ffmpeg, pulseaudio, and
+    all their transitive dependencies -- libblas, libprotocol-native,
+    libpulsecommon, etc.) live under /app/.apt/... instead of the
+    standard system library paths the dynamic linker searches by
+    default. Rather than discover and patch each missing library one at
+    a time as it's first needed (which is what kept happening), find
+    every directory under /app/.apt that actually contains a shared
+    library and add all of them to LD_LIBRARY_PATH once, before any
+    other code runs or spawns a subprocess. No-ops instantly on
+    non-Heroku hosts (VPS, Docker) where /app/.apt doesn't exist.
+    """
+    apt_root = "/app/.apt"
+    if not os.path.isdir(apt_root):
+        return
+    lib_dirs = set()
+    for dirpath, _dirnames, filenames in os.walk(apt_root):
+        if any(".so" in f for f in filenames):
+            lib_dirs.add(dirpath)
+    if not lib_dirs:
+        return
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(
+        sorted(lib_dirs) + ([existing] if existing else [])
+    )
+    print(f"[start] Added {len(lib_dirs)} apt library directory(ies) to LD_LIBRARY_PATH.")
+
+
+_fix_apt_library_paths()
+
 import asyncio
 import contextlib
 import sys
@@ -68,4 +102,3 @@ if __name__ == "__main__":
     with contextlib.suppress(KeyboardInterrupt):
         boot()
         sys.exit(0)
-      
