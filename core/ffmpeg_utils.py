@@ -54,6 +54,12 @@ def build_capture_command(
     ffmpeg command that reads the PulseAudio monitor of the bridge sink,
     applies volume/bass filters, and writes raw PCM into the FIFO used as
     input for the outgoing voice chat stream.
+
+    IMPORTANT: pytgcalls/tgcalls always expects raw PCM, 16-bit, 48kHz on
+    its audio input -- never a container format. Wrapping the stream in
+    a WAV header makes pytgcalls' internal reader try to probe/seek the
+    stream to read format info, which fails on a non-seekable named pipe
+    and surfaces as "Broken pipe" almost immediately after joining.
     """
     filters = build_audio_filters(level, bass, muted)
     return [
@@ -72,7 +78,7 @@ def build_capture_command(
         "-ar",
         str(SAMPLE_RATE),
         "-f",
-        "wav",
+        "s16le",
         "-y",
         output_pipe_path,
     ]
@@ -82,7 +88,8 @@ def build_silence_command(output_pipe_path: str) -> list:
     """
     The assistant must still send *something* while listening in the
     Logger Group's voice chat. We feed silence so the call stays open
-    without echoing anything back into that chat.
+    without echoing anything back into that chat. Raw PCM, same reason
+    as build_capture_command above.
     """
     return [
         "ffmpeg",
@@ -93,8 +100,12 @@ def build_silence_command(output_pipe_path: str) -> list:
         "lavfi",
         "-i",
         "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-ac",
+        str(CHANNELS),
+        "-ar",
+        str(SAMPLE_RATE),
         "-f",
-        "wav",
+        "s16le",
         "-y",
         output_pipe_path,
     ]
