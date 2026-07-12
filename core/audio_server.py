@@ -38,12 +38,6 @@ CHUNK_SIZE = 3840  # 20ms of stereo 16-bit 48kHz audio
 
 
 def _wav_header(data_size: int = 0x7FFFFFFF) -> bytes:
-    """
-    A canonical 44-byte WAV/RIFF header for continuous streaming.
-    data_size is a large placeholder since the real length is unknown
-    for a live stream; ffprobe/ffmpeg and pytgcalls' internal decoder
-    both tolerate this for streamed WAV.
-    """
     byte_rate = SAMPLE_RATE * CHANNELS * BITS_PER_SAMPLE // 8
     block_align = CHANNELS * BITS_PER_SAMPLE // 8
     return b"".join(
@@ -62,9 +56,6 @@ def _wav_header(data_size: int = 0x7FFFFFFF) -> bytes:
 
 
 class _LiveStream:
-    """One ffmpeg producer (reading its stdout) fanned out to any number
-    of concurrently-connected HTTP clients."""
-
     def __init__(self, cmd: List[str], name: str):
         self.cmd = cmd
         self.name = name
@@ -138,13 +129,6 @@ class _LiveStream:
 
 
 class AudioHTTPBridge:
-    """
-    Single shared local HTTP server for the whole app. Each active
-    session registers its silence-feed and audio-capture streams under
-    a unique key and gets back a `http://127.0.0.1:<port>/audio/<key>`
-    URL to hand to pytgcalls' MediaStream instead of a FIFO path.
-    """
-
     def __init__(self, host: str = "127.0.0.1", port: int = 8600):
         self.host = host
         self.port = port
@@ -201,9 +185,8 @@ class AudioHTTPBridge:
             while True:
                 chunk = await q.get()
                 await response.write(chunk)
-        except (ConnectionResetError, asyncio.CancelledError, ConnectionAbortedError):
+        except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
             stream.unsubscribe(q)
         return response
-  
