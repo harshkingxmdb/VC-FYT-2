@@ -107,9 +107,20 @@ class CallManager:
             ) from exc
 
     async def join(self, target_chat_id: int) -> ForwardSession:
-        if target_chat_id in self.sessions:
-            log.info("Session for chat_id=%s already active; re-using it.", target_chat_id)
-            return self.sessions[target_chat_id]
+        existing = self.sessions.get(target_chat_id)
+        if existing is not None:
+            if await self._is_actually_in_call(
+                existing.logger_chat_id
+            ) and await self._is_actually_in_call(existing.target_chat_id):
+                log.info("Session for chat_id=%s already active; re-using it.", target_chat_id)
+                return existing
+            log.warning(
+                "Session for chat_id=%s was marked active but the call has "
+                "actually dropped; reconnecting instead of reusing it.",
+                target_chat_id,
+            )
+            await self._reconnect(existing)
+            return existing
 
         await self._resolve_peer(target_chat_id, "target chat")
         await self._resolve_peer(config.LOGGER_GROUP, "Logger Group")
@@ -257,6 +268,13 @@ class CallManager:
             await self.leave(chat_id)
         return len(chat_ids)
 
+    async def _is_actually_in_call(self, chat_id: int) -> bool:
+        try:
+            await self.pytgcalls.played_time(chat_id)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _watchdog(self, session: ForwardSession) -> None:
         delay = RECONNECT_BASE_DELAY
         while not session.stopping:
@@ -268,6 +286,8 @@ class CallManager:
                 session.connected
                 and self.audio_bridge.is_stream_alive(session.capture_key)
                 and self.audio_bridge.is_stream_alive(session.silence_key)
+                and await self._is_actually_in_call(session.logger_chat_id)
+                and await self._is_actually_in_call(session.target_chat_id)
             )
             if healthy:
                 delay = RECONNECT_BASE_DELAY
