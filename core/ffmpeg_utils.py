@@ -111,6 +111,62 @@ def build_silence_command(output_pipe_path: str) -> list:
     ]
 
 
+def build_capture_command_stdout(
+    monitor_source: str,
+    level: int,
+    bass: int,
+    muted: bool = False,
+) -> list:
+    """
+    Same as build_capture_command, but writes raw PCM to stdout
+    (pipe:1) instead of a FIFO file, for use with AudioHTTPBridge.
+    """
+    filters = build_audio_filters(level, bass, muted)
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "pulse",
+        "-i",
+        monitor_source,
+        "-af",
+        filters,
+        "-ac",
+        str(CHANNELS),
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+
+
+def build_silence_command_stdout() -> list:
+    """
+    Same as build_silence_command, but writes raw PCM to stdout
+    (pipe:1) instead of a FIFO file, for use with AudioHTTPBridge.
+    """
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-ac",
+        str(CHANNELS),
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+
+
 def build_record_command(monitor_source: str, output_file_path: str) -> list:
     """
     Records the forwarded (post-filter) audio to a compressed file for
@@ -200,3 +256,4 @@ async def terminate(process: Optional[asyncio.subprocess.Process]) -> None:
         await process.wait()
     except ProcessLookupError:
         pass
+    
