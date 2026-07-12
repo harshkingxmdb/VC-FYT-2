@@ -23,6 +23,7 @@ import signal
 from pyrogram import Client
 
 import config
+from core.audio_server import AudioHTTPBridge
 from core.call_manager import CallManager
 from core.db import db
 from plugins import audio_controls, join_leave, recording, screenshare, utility
@@ -47,6 +48,26 @@ async def _resume_previous_sessions(call_manager: CallManager) -> None:
             log.info("Resumed session for chat_id=%s.", chat_id)
         except Exception:  # noqa: BLE001
             log.exception("Failed to resume session for chat_id=%s.", chat_id)
+
+
+async def _hydrate_peer_cache(assistant: Client) -> None:
+    """
+    Pyrogram (and pytgcalls, which reuses the same session) can only
+    operate on a chat once it has that chat's access_hash cached, which
+    only happens after the client has "seen" it via get_chat/get_dialogs
+    or an incoming update. Walking the dialog list once at startup
+    pre-caches every chat the assistant is currently a member of, so
+    /join doesn't fail with a cryptic "Peer id invalid" the first time
+    it's used against a chat the assistant hasn't interacted with yet.
+    """
+    count = 0
+    try:
+        async for _dialog in assistant.get_dialogs():
+            count += 1
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to hydrate assistant peer cache from dialogs.")
+        return
+    log.info("Hydrated assistant peer cache from %d dialog(s).", count)
 
 
 async def main() -> None:
@@ -74,7 +95,12 @@ async def main() -> None:
     await assistant.start()
     log.info("Bot and assistant Telegram clients started.")
 
-    call_manager = CallManager(assistant)
+    await _hydrate_peer_cache(assistant)
+
+    audio_bridge = AudioHTTPBridge()
+    await audio_bridge.start()
+
+    call_manager = CallManager(assistant, audio_bridge)
     await call_manager.start()
 
     join_leave.register(bot, call_manager)
@@ -116,6 +142,7 @@ async def main() -> None:
         await bot.send_message(config.OWNER_ID, "🛑 Bot is shutting down.")
 
     await call_manager.stop()
+    await audio_bridge.stop()
     await assistant.stop()
     await bot.stop()
     log.info("Shutdown complete.")
@@ -124,4 +151,3 @@ async def main() -> None:
 if __name__ == "__main__":
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(main())
-      
