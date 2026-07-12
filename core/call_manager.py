@@ -2,18 +2,28 @@
 Orchestrates everything that happens once /join is issued:
 
   * Ensures the PulseAudio bridge sink exists.
-  * Spawns an ffmpeg process that feeds silence into the Logger Group's
-    voice chat (so the assistant can sit there listening without ever
-    talking over the owner).
+  * Registers an ffmpeg-backed "silence-feed" live stream (served over
+    the local AudioHTTPBridge) so the assistant can sit in the Logger
+    Group's voice chat listening without ever talking over the owner.
   * Joins the Logger Group's voice chat with the assistant, using the
     PulseAudio sink as its playback device so whatever is spoken there
     is physically rendered into the bridge sink.
-  * Spawns a second ffmpeg process that reads the bridge sink's monitor,
-    applies the volume/bass filters, and writes the result into a FIFO.
+  * Registers an "audio-capture" live stream that reads the bridge
+    sink's monitor, applies the volume/bass filters, and serves the
+    result over HTTP.
   * Joins the target chat's voice chat with the assistant, streaming
-    that FIFO live.
+    that HTTP URL live.
   * Runs a watchdog task per-session that detects disconnects and
     automatically rejoins both voice chats.
+
+Streams are served over a local HTTP bridge (core/audio_server.py)
+rather than named pipes: pytgcalls runs `ffprobe` against its source
+once to detect format before ever opening it for real playback, and a
+FIFO can only be read start-to-finish exactly once by exactly one
+reader -- so the probe read would consume/break the single producer's
+output before real playback ever got a chance to read anything. HTTP
+sidesteps this since ffprobe's probe and pytgcalls' real playback
+become two independent requests to the same live source.
 
 One `CallManager` instance is shared by the whole app and tracks any
 number of concurrent forwarding sessions (spec: "support multiple
@@ -25,13 +35,14 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality
 from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
-from pyrogram.errors import FloodWait
 
 import config
 from core import ffmpeg_utils, pipe_manager, pulse_audio
+from core.audio_server import AudioHTTPBridge
 from core.db import db
 from core.logger import get_logger
 
@@ -40,6 +51,7 @@ log = get_logger(__name__)
 RECONNECT_BASE_DELAY = 3
 RECONNECT_MAX_DELAY = 60
 WATCHDOG_INTERVAL = 10
+STREAM_SETTLE_TIME = 0.6
 
 
 @dataclass
@@ -49,8 +61,8 @@ class ForwardSession:
     level: int = config.DEFAULT_LEVEL
     bass: int = config.DEFAULT_BASS
     muted: bool = False
-    capture_process: Optional[asyncio.subprocess.Process] = None
-    silence_process: Optional[asyncio.subprocess.Process] = None
+    silence_key: str = ""
+    capture_key: str = ""
     screenshare_process: Optional[asyncio.subprocess.Process] = None
     recording_process: Optional[asyncio.subprocess.Process] = None
     recording_path: Optional[str] = None
@@ -62,9 +74,10 @@ class ForwardSession:
 
 
 class CallManager:
-    def __init__(self, assistant: Client):
+    def __init__(self, assistant: Client, audio_bridge: AudioHTTPBridge):
         self.assistant = assistant
         self.pytgcalls = PyTgCalls(assistant)
+        self.audio_bridge = audio_bridge
         self.sessions: Dict[int, ForwardSession] = {}
         self._bridge_ready = False
         self._register_update_handlers()
@@ -163,6 +176,8 @@ class CallManager:
             bass=settings.get("bass", config.DEFAULT_BASS),
             muted=settings.get("muted", False),
             monitor_source=monitor_source,
+            silence_key=f"{target_chat_id}_in",
+            capture_key=f"{target_chat_id}_out",
         )
         self.sessions[target_chat_id] = session
 
@@ -179,21 +194,22 @@ class CallManager:
 
     async def _connect_session(self, session: ForwardSession) -> None:
         async with session.lock:
-            silence_pipe = pipe_manager.create_pipe(session.target_chat_id, "in")
-            output_pipe = pipe_manager.create_pipe(session.target_chat_id, "out")
-
             # 1) Keep the Logger Group's voice chat fed with silence so the
             #    assistant can listen without talking over the owner.
-            session.silence_process = await ffmpeg_utils.spawn(
-                ffmpeg_utils.build_silence_command(silence_pipe), name="silence-feed"
+            silence_url = await self.audio_bridge.register_stream(
+                session.silence_key,
+                ffmpeg_utils.build_silence_command_stdout(),
+                name="silence-feed",
             )
-            await ffmpeg_utils.ensure_alive(session.silence_process, "silence-feed ffmpeg")
+            await asyncio.sleep(STREAM_SETTLE_TIME)
+            if not self.audio_bridge.is_stream_alive(session.silence_key):
+                raise RuntimeError("silence-feed ffmpeg exited immediately after starting.")
 
             try:
                 await self.pytgcalls.play(
                     session.logger_chat_id,
                     MediaStream(
-                        silence_pipe,
+                        silence_url,
                         AudioQuality.STUDIO,
                         video_flags=MediaStream.Flags.IGNORE,
                     ),
@@ -207,22 +223,25 @@ class CallManager:
                 )
                 raise
 
-            # 2) Capture the bridge sink's monitor, apply filters, write to
-            #    the output FIFO that will feed the target voice chat.
-            session.capture_process = await ffmpeg_utils.spawn(
-                ffmpeg_utils.build_capture_command(
-                    session.monitor_source, output_pipe, session.level, session.bass, session.muted
+            # 2) Capture the bridge sink's monitor, apply filters, serve it
+            #    over HTTP for the target voice chat to stream.
+            capture_url = await self.audio_bridge.register_stream(
+                session.capture_key,
+                ffmpeg_utils.build_capture_command_stdout(
+                    session.monitor_source, session.level, session.bass, session.muted
                 ),
                 name="audio-capture",
             )
-            await ffmpeg_utils.ensure_alive(session.capture_process, "audio-capture ffmpeg")
+            await asyncio.sleep(STREAM_SETTLE_TIME)
+            if not self.audio_bridge.is_stream_alive(session.capture_key):
+                raise RuntimeError("audio-capture ffmpeg exited immediately after starting.")
 
-            # 3) Join the target chat's voice chat, streaming that FIFO.
+            # 3) Join the target chat's voice chat, streaming that URL.
             try:
                 await self.pytgcalls.play(
                     session.target_chat_id,
                     MediaStream(
-                        output_pipe,
+                        capture_url,
                         AudioQuality.STUDIO,
                         video_flags=MediaStream.Flags.IGNORE,
                     ),
@@ -259,11 +278,11 @@ class CallManager:
                 except (NotInCallError, Exception) as exc:  # noqa: BLE001
                     log.debug("leave_call(logger) raised %s (already left?).", exc)
 
-            await ffmpeg_utils.terminate(session.capture_process)
-            await ffmpeg_utils.terminate(session.silence_process)
+            await self.audio_bridge.remove_stream(session.capture_key)
+            await self.audio_bridge.remove_stream(session.silence_key)
             await ffmpeg_utils.terminate(session.screenshare_process)
             await ffmpeg_utils.terminate(session.recording_process)
-            pipe_manager.cleanup_all(target_chat_id)
+            pipe_manager.cleanup_pipe(target_chat_id, "screen")
 
         del self.sessions[target_chat_id]
         await db.remove_session(target_chat_id)
@@ -288,8 +307,7 @@ class CallManager:
         except Exception as exc:  # noqa: BLE001
             log.debug("leave_call(logger, global) raised %s", exc)
         for session in self.sessions.values():
-            await ffmpeg_utils.terminate(session.silence_process)
-            session.silence_process = None
+            await self.audio_bridge.remove_stream(session.silence_key)
         return count
 
     async def leave_all(self) -> int:
@@ -310,10 +328,8 @@ class CallManager:
 
             healthy = (
                 session.connected
-                and session.capture_process is not None
-                and session.capture_process.returncode is None
-                and session.silence_process is not None
-                and session.silence_process.returncode is None
+                and self.audio_bridge.is_stream_alive(session.capture_key)
+                and self.audio_bridge.is_stream_alive(session.silence_key)
             )
             if healthy:
                 delay = RECONNECT_BASE_DELAY
@@ -348,8 +364,8 @@ class CallManager:
 
     async def _reconnect(self, session: ForwardSession) -> None:
         async with session.lock:
-            await ffmpeg_utils.terminate(session.capture_process)
-            await ffmpeg_utils.terminate(session.silence_process)
+            await self.audio_bridge.remove_stream(session.capture_key)
+            await self.audio_bridge.remove_stream(session.silence_key)
             for chat_id in (session.logger_chat_id, session.target_chat_id):
                 try:
                     await self.pytgcalls.leave_call(chat_id)
@@ -390,19 +406,19 @@ class CallManager:
 
     async def _restart_capture(self, session: ForwardSession) -> None:
         async with session.lock:
-            await ffmpeg_utils.terminate(session.capture_process)
-            output_pipe = pipe_manager.get_output_pipe(session.target_chat_id)
-            session.capture_process = await ffmpeg_utils.spawn(
-                ffmpeg_utils.build_capture_command(
+            await self.audio_bridge.register_stream(
+                session.capture_key,
+                ffmpeg_utils.build_capture_command_stdout(
                     session.monitor_source,
-                    output_pipe,
                     session.level,
                     session.bass,
                     session.muted,
                 ),
                 name="audio-capture",
             )
-            await ffmpeg_utils.ensure_alive(session.capture_process, "audio-capture ffmpeg")
+            await asyncio.sleep(STREAM_SETTLE_TIME)
+            if not self.audio_bridge.is_stream_alive(session.capture_key):
+                raise RuntimeError("audio-capture ffmpeg exited immediately after restart.")
         log.info(
             "Applied audio settings for chat_id=%s: level=%s bass=%s muted=%s",
             session.target_chat_id,
@@ -467,47 +483,6 @@ class CallManager:
         pipe_manager.cleanup_pipe(target_chat_id, "screen")
 
         # Fall back to the plain audio-only stream.
-        output_pipe = pipe_manager.get_output_pipe(target_chat_id)
+        capture_url = self.audio_bridge.url_for(session.capture_key)
         await self.pytgcalls.play(
-            target_chat_id,
-            MediaStream(
-                output_pipe,
-                AudioQuality.STUDIO,
-                video_flags=MediaStream.Flags.IGNORE,
-            ),
-        )
-        log.info("Screen share stopped for chat_id=%s.", target_chat_id)
-        return True
-
-    # ------------------------------------------------------------------ #
-    # Recording
-    # ------------------------------------------------------------------ #
-    async def start_recording(self, target_chat_id: int) -> Optional[str]:
-        session = self.sessions.get(target_chat_id)
-        if session is None or session.recording_process is not None:
-            return None
-
-        import os
-        import time
-
-        filename = f"vc_recording_{target_chat_id}_{int(time.time())}.mp3"
-        output_path = os.path.join(config.RECORDINGS_DIR, filename)
-
-        session.recording_process = await ffmpeg_utils.spawn(
-            ffmpeg_utils.build_record_command(session.monitor_source, output_path)
-        )
-        session.recording_path = output_path
-        log.info("Recording started for chat_id=%s -> %s", target_chat_id, output_path)
-        return output_path
-
-    async def stop_recording(self, target_chat_id: int) -> Optional[str]:
-        session = self.sessions.get(target_chat_id)
-        if session is None or session.recording_process is None:
-            return None
-
-        await ffmpeg_utils.terminate(session.recording_process)
-        session.recording_process = None
-        path = session.recording_path
-        session.recording_path = None
-        log.info("Recording stopped for chat_id=%s -> %s", target_chat_id, path)
-        return path
+            target
